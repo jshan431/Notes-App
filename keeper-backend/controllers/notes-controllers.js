@@ -3,21 +3,8 @@ const { validationResult } = require('express-validator');
 const uuid = require('uuid/v4');
 const HttpError = require('../models/http-error');
 const Note = require('../models/note');
-
-let DUMMY_NOTES = [
-  {
-    id: 'p1',
-    title: 'Empire State Building',
-    description: 'One of the most famous sky scrapers in the world!',
-    creator: 'u1'
-  },
-  {
-    id: 'p2',
-    title: 'Wall Street',
-    description: 'Where the money lives',
-    creator: 'u1'
-  }
-]
+const User = require('../models/user');
+const mongoose = require('mongoose');
 
 const getNoteById = async (req, res, next) => {
   const noteId = req.params.nid;
@@ -56,7 +43,7 @@ const getNotesByUserId = async (req, res, next) => {
   try{
     // Have to specify the key and value of thing to find which find returns an array
     notes = await Note.find({ creator : userId});
-  }catch(err){
+  } catch(err){
     //error will be caught if get request has problem
     const error = new HttpError(
       'Fetching junks failed, please try again later',
@@ -73,7 +60,7 @@ const getNotesByUserId = async (req, res, next) => {
     return next(error);
   }
 
-  // since junks is a mongoose array we use map on each element and make it into an object
+  // since notes is a mongoose array we use map on each element and make it into an object
   res.json({notes: notes.map(note => note.toObject({ getters: true}))});
 }
 
@@ -94,9 +81,38 @@ const createNote = async (req, res, next) => {
     creator
   });
 
-  //store create Note document to db
+  // Check if user exist in DB
+  let user;
   try{
-    await createdNote.save();
+    user = await User.findById(creator);
+  } catch (err) {
+    const error = new HttpError(
+      'Creating place failed, please try again',
+      500
+    );
+    return next(error);
+  }
+
+  if(!user){
+    const error = new HttpError(
+      'Could not find user for provided id',
+      500
+    );
+    return next(error);
+  }
+
+  console.log(user);
+
+  //store created Note document to db, assign user note array with created Note
+  try{
+    const sess = await mongoose.startSession();
+    sess.startTransaction();
+    //save created place to db
+    await createdNote.save({ session: sess});
+    //add note to user
+    user.notes.push(createdNote);
+    await user.save({ session: sess});
+    await sess.commitTransaction();
   }catch(err){
     const error = new HttpError(
       'Creating note failed, please try again.',
@@ -109,40 +125,87 @@ const createNote = async (req, res, next) => {
   res.status(201).json({note: createdNote});
 };
 
-const updateNote = (req, res, next) => {
+const updateNote = async (req, res, next) => {
   //look at req and check if any validation errors were detected
   const errors = validationResult(req);
   if(!errors.isEmpty()){
-    throw new HttpError('Invalid inputs passed, please check your data.', 422);
+    return next(
+      new HttpError('Invalid inputs passed, please check your data.', 422)
+    );
   }
 
   const { title, description} = req.body;
   const noteId = req.params.nid;
 
-  // Make a copy of the place that will be updated
-  const updatedNote = { ...DUMMY_NOTES.find(note => note.id === noteId)};
+  //Search DB
+  let note;
+  try {
+    note = await Note.findById(noteId);
+  } catch (err){
+    const error = new HttpError(
+      'Something went wrong, couldnt not update place.', 500
+    );
+    return next(error);
+  }
 
-  // find index of the note to update
-  const placeIndex = DUMMY_NOTES.findIndex(note => note.id === noteId);
+  //make changes for the found note in the DB
+  note.title = title;
+  note.description = description;
 
-  //make changes to the copy
-  updatedNote.title = title;
-  updatedNote.description = description;
+  //store updated note 
+  try{
+    await note.save();
+  } catch (err){
+    const error = new HttpError(
+      'Something went wrong. Could not update place.', 500
+    );
+    return next(error);
+  }
 
-  //swap updated note with the old note
-  DUMMY_NOTES[placeIndex] = updatedNote;
-
-  res.status(200).json({note: updatedNote});
+  //turn our given mongoose object back to a JS object.
+  res.status(200).json({note: note.toObject({getters: true})});
 }
 
-const deleteNote = (req, res, next) => {
+const deleteNote = async (req, res, next) => {
   const noteId = req.params.nid;
-  const deletedNote = DUMMY_NOTES.find(note => note.id === noteId);
-  if(!deletedNote){
-    throw new HttpError('Could not find a place for that id', 401);
+
+  //Search DB
+  let note;
+  try{
+    note = await Note.findById(noteId).populate('creator');
+  } catch (err) {
+    const error = new HttpError(
+      'Something went wrong, could not delete place.',
+      500
+    );
+    return next(error);
   }
-  DUMMY_NOTES = DUMMY_NOTES.filter(note => note.id !== noteId);
-  res.status(200).json({note: deletedNote})
+
+  if(!note){
+    const error = new HttpError(
+      'Could not find note for this id',
+      404
+    );
+    return next(error);
+  }
+
+  // Try removing note from notes collection and remove the note from creator's notes array
+  try{
+    const sess = await mongoose.startSession();
+    sess.startTransaction();
+    await note.remove({session: sess});
+    note.creator.notes.pull(note);      // we are able to do this because of populate
+    await note.creator.save({session: sess});
+    await sess.commitTransaction();
+  } catch (err) {
+    const error = new HttpError(
+      'Something went wrong, could not delete place.',
+      500
+    );
+    return next(error);
+  }
+
+  res.status(200).json({note: note.toObject({getters : true})})
 }
 
 //export pointers to the functions
